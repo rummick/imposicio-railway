@@ -55,9 +55,32 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
         ow,oh = float(mb[2])-ox, float(mb[3])-oy
         pg.cropbox = Rectangle(ox+(ow-CW)/2, oy+(oh-CH)/2,
                                ox+(ow-CW)/2+CW, oy+(oh-CH)/2+CH)
-        xobj = out.copy_foreign(pg.as_form_xobject())
+
+        # Copy page to temp PDF first to avoid "direct object" error
+        tmp = Pdf.new()
+        tmp.pages.append(tmp.copy_foreign(pg))
+        tmp_pg = tmp.pages[0]
+        xobj = out.copy_foreign(tmp_pg.as_form_xobject())
+
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         res = pikepdf.Dictionary(XObject=xd)
+        mirror = (pi == 1)
+        lines = []
+        for r in range(rows):
+            for c in range(cols):
+                ci = (cols-1-c) if mirror else c
+                x = sx + ci*(CW+GP)
+                y = sy + (rows-1-r)*(CH+GP)
+                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
+                if border and bw > 0:
+                    bwpt = pt(bw); bc = border
+                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
+                                 f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
+        out.pages.append(pikepdf.Page(pikepdf.Dictionary(
+            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
+            Resources=res,
+            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
+        )))
         mirror = (pi == 1)
         lines = []
         for r in range(rows):
