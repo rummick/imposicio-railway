@@ -56,11 +56,13 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
         pg.cropbox = Rectangle(ox+(ow-CW)/2, oy+(oh-CH)/2,
                                ox+(ow-CW)/2+CW, oy+(oh-CH)/2+CH)
 
-        # Copy page to temp PDF first to avoid "direct object" error
+        # Copy page to temp PDF to ensure it's an indirect object
         tmp = Pdf.new()
         tmp.pages.append(tmp.copy_foreign(pg))
-        tmp_pg = tmp.pages[0]
-        xobj = out.copy_foreign(tmp_pg.as_form_xobject())
+        tmp.save(io.BytesIO())  # force objectification
+        tmp2 = Pdf.new()
+        tmp2.pages.append(tmp2.copy_foreign(tmp.pages[0]))
+        xobj = out.copy_foreign(tmp2.pages[0].as_form_xobject())
 
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         res = pikepdf.Dictionary(XObject=xd)
