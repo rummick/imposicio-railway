@@ -42,66 +42,71 @@ COLORS = {
 }
 
 def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw):
-    src = Pdf.open(io.BytesIO(src_bytes))
-    out = Pdf.new()
+    # Save/reload per garantir objectes indirectes
+    buf0 = io.BytesIO()
+    Pdf.open(io.BytesIO(src_bytes)).save(buf0)
+    src_bytes2 = buf0.getvalue()
+
     SW,SH,CW,CH,GP = pt(sw),pt(sh),pt(cw),pt(ch),pt(gap)
     sx = (SW - cols*CW - (cols-1)*GP) / 2
     sy = (SH - rows*CH - (rows-1)*GP) / 2
 
-    for pi in range(min(sides, len(src.pages))):
+    result_pages = []
+
+    for pi in range(min(sides, Pdf.open(io.BytesIO(src_bytes2)).page_count)):
+        src = Pdf.open(io.BytesIO(src_bytes2))
         pg = src.pages[pi]
         mb = pg.mediabox
         ox,oy = float(mb[0]),float(mb[1])
         ow,oh = float(mb[2])-ox, float(mb[3])-oy
-        pg.cropbox = Rectangle(ox+(ow-CW)/2, oy+(oh-CH)/2,
-                               ox+(ow-CW)/2+CW, oy+(oh-CH)/2+CH)
 
-        # Copy page to temp PDF to ensure it's an indirect object
-        tmp = Pdf.new()
-        tmp.pages.append(tmp.copy_foreign(pg))
-        tmp.save(io.BytesIO())  # force objectification
-        tmp2 = Pdf.new()
-        tmp2.pages.append(tmp2.copy_foreign(tmp.pages[0]))
-        xobj = out.copy_foreign(tmp2.pages[0].as_form_xobject())
+        # Aplica cropbox
+        cx0 = ox + (ow-CW)/2
+        cy0 = oy + (oh-CH)/2
+        pg.cropbox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
+        pg.mediabox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
 
+        # Guarda pàgina com PDF independent i recarrega
+        single = Pdf.new()
+        single.pages.append(single.copy_foreign(pg))
+        sbuf = io.BytesIO(); single.save(sbuf); sbuf.seek(0)
+        single2 = Pdf.open(sbuf)
+
+        # Ara sí podem fer as_form_xobject
+        out = Pdf.new()
+        xobj = out.copy_foreign(single2.pages[0].as_form_xobject())
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         res = pikepdf.Dictionary(XObject=xd)
-        mirror = (pi == 1)
-        lines = []
-        for r in range(rows):
-            for c in range(cols):
-                ci = (cols-1-c) if mirror else c
-                x = sx + ci*(CW+GP)
-                y = sy + (rows-1-r)*(CH+GP)
-                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
-                if border and bw > 0:
-                    bwpt = pt(bw); bc = border
-                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
-                                 f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
-        out.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=res,
-            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
-        )))
-        mirror = (pi == 1)
-        lines = []
-        for r in range(rows):
-            for c in range(cols):
-                ci = (cols-1-c) if mirror else c
-                x = sx + ci*(CW+GP)
-                y = sy + (rows-1-r)*(CH+GP)
-                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
-                if border and bw > 0:
-                    bwpt = pt(bw); bc = border
-                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
-                                 f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
-        out.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=res,
-            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
-        )))
 
-    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
+        mirror = (pi == 1)
+        lines = []
+        for r in range(rows):
+            for c in range(cols):
+                ci = (cols-1-c) if mirror else c
+                x = sx + ci*(CW+GP)
+                y = sy + (rows-1-r)*(CH+GP)
+                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
+                if border and bw > 0:
+                    bwpt = pt(bw); bc = border
+                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
+                                 f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
+
+        sheet = pikepdf.Page(pikepdf.Dictionary(
+            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
+            Resources=res,
+            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
+        ))
+        out.pages.append(sheet)
+        page_buf = io.BytesIO(); out.save(page_buf)
+        result_pages.append(page_buf.getvalue())
+
+    # Combina totes les pàgines
+    final = Pdf.new()
+    for pb in result_pages:
+        p = Pdf.open(io.BytesIO(pb))
+        final.pages.append(final.copy_foreign(p.pages[0]))
+
+    buf = io.BytesIO(); final.save(buf); return buf.getvalue()
 
 
 def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
