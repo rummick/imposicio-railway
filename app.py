@@ -1,15 +1,50 @@
 from flask import Flask, request, jsonify, send_file
 import pikepdf
 from pikepdf import Pdf, Rectangle
-import fitz  # PyMuPDF
+import fitz
 from PIL import Image
-import io, base64, os, traceback
+import io, os, traceback
 
 app = Flask(__name__)
-
 MM = 72 / 25.4
 
 def pt(mm): return mm * MM
+
+def deep_copy_obj(obj, target_pdf):
+    """Deep copy a pikepdf object handling both direct and indirect objects."""
+    try:
+        if obj.is_indirect:
+            return target_pdf.copy_foreign(obj)
+    except Exception:
+        pass
+    if isinstance(obj, pikepdf.Dictionary):
+        d = pikepdf.Dictionary()
+        for k, v in obj.items():
+            try: d[k] = deep_copy_obj(v, target_pdf)
+            except Exception: pass
+        return d
+    elif isinstance(obj, pikepdf.Array):
+        return pikepdf.Array([deep_copy_obj(i, target_pdf) for i in obj])
+    elif isinstance(obj, pikepdf.Stream):
+        try: return target_pdf.copy_foreign(obj)
+        except Exception:
+            new_s = pikepdf.Stream(target_pdf, obj.read_bytes())
+            for k, v in obj.stream_dict.items():
+                try: new_s.stream_dict[k] = deep_copy_obj(v, target_pdf)
+                except Exception: pass
+            return new_s
+    else:
+        try: return target_pdf.copy_foreign(obj)
+        except Exception: return obj
+
+def get_page_stream(pg):
+    """Get concatenated content stream bytes from a page."""
+    contents = pg.obj.get('/Contents')
+    if contents is None:
+        return b''
+    if isinstance(contents, pikepdf.Array):
+        return b' '.join(s.read_bytes() for s in contents)
+    return contents.read_bytes()
 
 def extend_bleed(img, bpx, method):
     w, h = img.size
@@ -37,49 +72,48 @@ def extend_bleed(img, bpx, method):
     return out
 
 COLORS = {
-    'black':(0,0,0), 'white':(1,1,1), 'cyan':(0,1,1),
-    'magenta':(1,0,1), 'yellow':(1,1,0), 'red':(1,0,0)
+    'black':(0,0,0),'white':(1,1,1),'cyan':(0,1,1),
+    'magenta':(1,0,1),'yellow':(1,1,0),'red':(1,0,0)
 }
 
 def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw):
-    # Save/reload per garantir objectes indirectes
+    # Reload with object streams disabled to stabilise object references
+    src0 = Pdf.open(io.BytesIO(src_bytes))
     buf0 = io.BytesIO()
-    Pdf.open(io.BytesIO(src_bytes)).save(buf0)
-    src_bytes2 = buf0.getvalue()
+    src0.pages.extend(src0.pages[:0])  # noop touch
+    src0.save(buf0, object_stream_mode=pikepdf.ObjectStreamMode.disable)
+    src = Pdf.open(io.BytesIO(buf0.getvalue()))
 
     SW,SH,CW,CH,GP = pt(sw),pt(sh),pt(cw),pt(ch),pt(gap)
     sx = (SW - cols*CW - (cols-1)*GP) / 2
     sy = (SH - rows*CH - (rows-1)*GP) / 2
+    out = Pdf.new()
 
-    result_pages = []
-
-    for pi in range(min(sides, Pdf.open(io.BytesIO(src_bytes2)).page_count)):
-        src = Pdf.open(io.BytesIO(src_bytes2))
+    for pi in range(min(sides, len(src.pages))):
         pg = src.pages[pi]
         mb = pg.mediabox
         ox,oy = float(mb[0]),float(mb[1])
         ow,oh = float(mb[2])-ox, float(mb[3])-oy
 
-        # Aplica cropbox
-        cx0 = ox + (ow-CW)/2
-        cy0 = oy + (oh-CH)/2
+        # Apply crop
+        cx0 = ox + (ow-CW)/2; cy0 = oy + (oh-CH)/2
         pg.cropbox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
         pg.mediabox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
 
-        # Guarda pàgina com PDF independent i recarrega
-        single = Pdf.new()
-        single.pages.append(single.copy_foreign(pg))
-        sbuf = io.BytesIO(); single.save(sbuf); sbuf.seek(0)
-        single2 = Pdf.open(sbuf)
+        stream_data = get_page_stream(pg)
+        resources = pg.obj.get('/Resources', pikepdf.Dictionary())
+        res_copy = deep_copy_obj(resources, out)
 
-        # Ara sí podem fer as_form_xobject
-        out = Pdf.new()
-        xobj = out.copy_foreign(single2.pages[0].as_form_xobject())
+        xobj = pikepdf.Stream(out, stream_data,
+            Type=pikepdf.Name.XObject,
+            Subtype=pikepdf.Name.Form,
+            BBox=pikepdf.Array([0, 0, CW, CH]),
+            Resources=res_copy
+        )
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
-        res = pikepdf.Dictionary(XObject=xd)
+        page_res = pikepdf.Dictionary(XObject=xd)
 
-        mirror = (pi == 1)
-        lines = []
+        mirror = (pi == 1); lines = []
         for r in range(rows):
             for c in range(cols):
                 ci = (cols-1-c) if mirror else c
@@ -91,23 +125,13 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
                     lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
                                  f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
 
-        sheet = pikepdf.Page(pikepdf.Dictionary(
+        out.pages.append(pikepdf.Page(pikepdf.Dictionary(
             Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=res,
+            Resources=page_res,
             Contents=pikepdf.Stream(out, "\n".join(lines).encode())
-        ))
-        out.pages.append(sheet)
-        page_buf = io.BytesIO(); out.save(page_buf)
-        result_pages.append(page_buf.getvalue())
+        )))
 
-    # Combina totes les pàgines
-    final = Pdf.new()
-    for pb in result_pages:
-        p = Pdf.open(io.BytesIO(pb))
-        final.pages.append(final.copy_foreign(p.pages[0]))
-
-    buf = io.BytesIO(); final.save(buf); return buf.getvalue()
-
+    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
 
 def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
                   border, bw, dpi, method):
@@ -126,50 +150,42 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
         cwpt,chpt = pt(cw), pt(ch)
         ox0,oy0 = (ow-cwpt)/2, (oh-chpt)/2
         pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
-        img = Image.frombytes("RGB", [pix.width,pix.height], pix.samples)
+        img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
         cx0=max(0,int(ox0*scale)); cy0=max(0,int(oy0*scale))
         cx1=min(img.width,int((ox0+cwpt)*scale))
         cy1=min(img.height,int((oy0+chpt)*scale))
-        cropped = img.crop((cx0,cy0,cx1,cy1))
-        bpx = int(bleed*(dpi/25.4))
-        wb = extend_bleed(cropped, bpx, method)
+        wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
 
-        png = io.BytesIO(); wb.save(png,'PNG'); png_b = png.getvalue()
-        ip = Pdf.new()
-        st = pikepdf.Stream(ip, png_b,
-            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
-            Width=wb.width, Height=wb.height,
-            ColorSpace=pikepdf.Name.DeviceRGB,
-            BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
-        imd = pikepdf.Dictionary(); imd["/Im"] = st
+        png=io.BytesIO(); wb.save(png,'PNG'); png_b=png.getvalue()
+        ip=Pdf.new()
+        imd=pikepdf.Dictionary(); 
+        st=pikepdf.Stream(ip,png_b,Type=pikepdf.Name.XObject,Subtype=pikepdf.Name.Image,
+            Width=wb.width,Height=wb.height,ColorSpace=pikepdf.Name.DeviceRGB,
+            BitsPerComponent=8,Filter=pikepdf.Name.FlateDecode)
+        imd["/Im"]=st
         ip.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page, MediaBox=[0,0,TW,TH],
+            Type=pikepdf.Name.Page,MediaBox=[0,0,TW,TH],
             Resources=pikepdf.Dictionary(XObject=imd),
-            Contents=pikepdf.Stream(ip,
-                f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode())
-        )))
-        ib = io.BytesIO(); ip.save(ib); ib.seek(0)
-        xobj = out.copy_foreign(Pdf.open(ib).pages[0].as_form_xobject())
-        xd2 = pikepdf.Dictionary(); xd2["/C"] = xobj
-        res2 = pikepdf.Dictionary(XObject=xd2)
-        mirror = (pi == 1); lines = []
+            Contents=pikepdf.Stream(ip,f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode()))))
+        ib=io.BytesIO(); ip.save(ib); ib.seek(0)
+        xobj=out.copy_foreign(Pdf.open(ib).pages[0].as_form_xobject())
+        xd2=pikepdf.Dictionary(); xd2["/C"]=xobj
+        res2=pikepdf.Dictionary(XObject=xd2)
+        mirror=(pi==1); lines=[]
         for r in range(rows):
             for c in range(cols):
-                ci = (cols-1-c) if mirror else c
-                x = sx + ci*(TW+GP)
-                y = sy + (rows-1-r)*(TH+GP)
+                ci=(cols-1-c) if mirror else c
+                x=sx+ci*(TW+GP); y=sy+(rows-1-r)*(TH+GP)
                 lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
-                if border and bw > 0:
-                    bwpt = pt(bw); bc = border
+                if border and bw>0:
+                    bwpt=pt(bw); bc=border
                     lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
                                  f"{x:.3f} {y:.3f} {TW:.3f} {TH:.3f} re S")
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=res2,
-            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
-        )))
+            Type=pikepdf.Name.Page,MediaBox=[0,0,SW,SH],
+            Resources=res2,Contents=pikepdf.Stream(out,"\n".join(lines).encode()))))
 
-    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
+    buf=io.BytesIO(); out.save(buf); return buf.getvalue()
 
 
 @app.after_request
@@ -201,44 +217,31 @@ def impose():
     try:
         pdf_bytes = request.files['pdf'].read()
         p = request.form
+        sw=float(p.get('sheetW',320)); sh=float(p.get('sheetH',450))
+        cw=float(p.get('cropW',0)) or None; ch=float(p.get('cropH',0)) or None
+        cols=int(p.get('cols',3)); rows=int(p.get('rows',6))
+        gap=float(p.get('gap',0)); sides=int(p.get('sides',1))
+        bleed=float(p.get('bleedMM',0)); bmet=p.get('bleedMethod','stretch')
+        dpi=int(p.get('renderDPI',300))
+        bcol=COLORS.get(p.get('borderColor','')); bw=float(p.get('borderWidth',0.25))
 
-        sw    = float(p.get('sheetW', 320))
-        sh    = float(p.get('sheetH', 450))
-        cw    = float(p.get('cropW', 0)) or None
-        ch    = float(p.get('cropH', 0)) or None
-        cols  = int(p.get('cols', 3))
-        rows  = int(p.get('rows', 6))
-        gap   = float(p.get('gap', 0))
-        sides = int(p.get('sides', 1))
-        bleed = float(p.get('bleedMM', 0))
-        bmet  = p.get('bleedMethod', 'stretch')
-        dpi   = int(p.get('renderDPI', 300))
-        bcol  = COLORS.get(p.get('borderColor', ''))
-        bw    = float(p.get('borderWidth', 0.25))
+        src=Pdf.open(io.BytesIO(pdf_bytes)); pg0=src.pages[0]; mb=pg0.mediabox
+        cw=cw or round((float(mb[2])-float(mb[0]))/MM,2)
+        ch=ch or round((float(mb[3])-float(mb[1]))/MM,2)
 
-        src = Pdf.open(io.BytesIO(pdf_bytes))
-        pg0 = src.pages[0]; mb = pg0.mediabox
-        ow_mm = (float(mb[2])-float(mb[0]))/MM
-        oh_mm = (float(mb[3])-float(mb[1]))/MM
-        cw = cw or ow_mm
-        ch = ch or oh_mm
-
-        if bleed > 0:
-            result = impose_raster(pdf_bytes, sw, sh, cw, ch, bleed,
-                                   cols, rows, gap, sides, bcol, bw, dpi, bmet)
+        if bleed>0:
+            result=impose_raster(pdf_bytes,sw,sh,cw,ch,bleed,cols,rows,gap,sides,bcol,bw,dpi,bmet)
         else:
-            result = impose_vector(pdf_bytes, sw, sh, cw, ch,
-                                   cols, rows, gap, sides, bcol, bw)
+            result=impose_vector(pdf_bytes,sw,sh,cw,ch,cols,rows,gap,sides,bcol,bw)
 
-        return send_file(
-            io.BytesIO(result),
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'impose_{cols}x{rows}.pdf'
-        )
+        return send_file(io.BytesIO(result), mimetype='application/pdf',
+                        as_attachment=True,
+                        download_name=f'impose_{cols}x{rows}.pdf')
     except Exception as e:
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
+@app.route('/', methods=['GET'])
+def health(): return jsonify({'status': 'ok', 'service': 'imposicio-railway'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
