@@ -120,24 +120,39 @@ COLORS = {
 }
 
 def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw):
-    src = Pdf.open(io.BytesIO(src_bytes))
+    src = Pdf.open(io.BytesIO(src_bytes))  # keep alive entire function
     out = Pdf.new()
     SW,SH,CW,CH,GP = pt(sw),pt(sh),pt(cw),pt(ch),pt(gap)
     sx = (SW - cols*CW - (cols-1)*GP) / 2
     sy = (SH - rows*CH - (rows-1)*GP) / 2
 
+    # Pre-extract all page data before any copying
+    page_data = []
     for pi in range(min(sides, len(src.pages))):
         pg = src.pages[pi]
         mb = pg.mediabox
         ox,oy = float(mb[0]),float(mb[1])
         ow,oh = float(mb[2])-ox, float(mb[3])-oy
 
-        # Apply crop
         cx0 = ox + (ow-CW)/2; cy0 = oy + (oh-CH)/2
         pg.cropbox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
         pg.mediabox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
 
-        xobj, xw, xh = make_xobject(pg, out)
+        stream_data = get_page_stream(pg)
+        resources = pg.obj.get('/Resources', pikepdf.Dictionary())
+        page_data.append((stream_data, resources))
+
+    # Now build output pages (src still alive)
+    for pi, (stream_data, resources) in enumerate(page_data):
+        res_copy = safe_copy(resources, out)
+
+        xobj = pikepdf.Stream(out, stream_data,
+            Type=pikepdf.Name.XObject,
+            Subtype=pikepdf.Name.Form,
+            FormType=1,
+            BBox=pikepdf.Array([0, 0, CW, CH]),
+            Resources=res_copy
+        )
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         page_res = pikepdf.Dictionary(XObject=xd)
 
@@ -159,7 +174,10 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
             Contents=pikepdf.Stream(out, "\n".join(lines).encode())
         )))
 
-    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
+    buf = io.BytesIO()
+    out.save(buf)
+    src.close()  # explicit close after save
+    return buf.getvalue()
 
 def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
                   border, bw, dpi, method):
