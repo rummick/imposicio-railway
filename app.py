@@ -180,12 +180,16 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
             Width=wb.width,Height=wb.height,ColorSpace=pikepdf.Name.DeviceRGB,
             BitsPerComponent=8,Filter=pikepdf.Name.FlateDecode)
         imd["/Im"]=st
-        ip.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page,MediaBox=[0,0,TW,TH],
-            Resources=pikepdf.Dictionary(XObject=imd),
-            Contents=pikepdf.Stream(ip,f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode()))))
-        ib=io.BytesIO(); ip.save(ib); ib.seek(0)
-        xobj=out.copy_foreign(Pdf.open(ib).pages[0].as_form_xobject())
+
+        # Build XObject manually without as_form_xobject
+        content_str = f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode()
+        xobj = pikepdf.Stream(out, content_str,
+            Type=pikepdf.Name.XObject,
+            Subtype=pikepdf.Name.Form,
+            FormType=1,
+            BBox=pikepdf.Array([0, 0, TW, TH]),
+            Resources=pikepdf.Dictionary(XObject=imd)
+        )
         xd2=pikepdf.Dictionary(); xd2["/C"]=xobj
         res2=pikepdf.Dictionary(XObject=xd2)
         mirror=(pi==1); lines=[]
