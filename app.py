@@ -11,7 +11,17 @@ MM = 72 / 25.4
 def pt(mm): return mm * MM
 
 def safe_copy(obj, pdf):
-    """Deep copy any pikepdf object into target pdf without needing indirect refs."""
+    """Deep copy any pikepdf object into target pdf."""
+    try:
+        # If indirect object from another PDF, copy_foreign
+        if hasattr(obj, 'is_indirect') and obj.is_indirect:
+            try:
+                return pdf.copy_foreign(obj)
+            except Exception:
+                pass  # Fall through to manual copy
+    except Exception:
+        pass
+
     if isinstance(obj, pikepdf.Stream):
         try:
             data = obj.read_bytes()
@@ -19,7 +29,7 @@ def safe_copy(obj, pdf):
             data = b''
         new_s = pikepdf.Stream(pdf, data)
         for k, v in obj.stream_dict.items():
-            if k in ('/Length', '/Filter', '/DecodeParms'):
+            if k in ('/Length',):
                 continue
             try:
                 new_s.stream_dict[k] = safe_copy(v, pdf)
@@ -43,7 +53,8 @@ def safe_copy(obj, pdf):
                 result.append(item)
         return pikepdf.Array(result)
     else:
-        return obj  # Name, String, Integer, Boolean, etc.
+        # Scalar: Name, String, Integer, Boolean, Real
+        return obj
 
 def get_page_stream(pg):
     contents = pg.obj.get('/Contents')
