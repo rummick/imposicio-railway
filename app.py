@@ -7,87 +7,68 @@ import io, os, traceback
 
 app = Flask(__name__)
 MM = 72 / 25.4
-
 def pt(mm): return mm * MM
 
-def safe_copy(obj, pdf):
-    """Deep copy any pikepdf object into target pdf."""
-    try:
-        # If indirect object from another PDF, copy_foreign
-        if hasattr(obj, 'is_indirect') and obj.is_indirect:
-            try:
-                return pdf.copy_foreign(obj)
-            except Exception:
-                pass  # Fall through to manual copy
-    except Exception:
-        pass
+def page_to_bytes(src_bytes, page_idx, cw_pt, ch_pt):
+    """Extract a page as standalone single-page PDF with crop applied."""
+    src = Pdf.open(io.BytesIO(src_bytes))
+    pg = src.pages[page_idx]
+    mb = pg.mediabox
+    ox,oy = float(mb[0]),float(mb[1])
+    ow,oh = float(mb[2])-ox, float(mb[3])-oy
+    cx0 = ox + (ow-cw_pt)/2; cy0 = oy + (oh-ch_pt)/2
+    pg.cropbox = Rectangle(cx0, cy0, cx0+cw_pt, cy0+ch_pt)
+    pg.mediabox = Rectangle(cx0, cy0, cx0+cw_pt, cy0+ch_pt)
+    single = Pdf.new()
+    single.pages.extend([pg])
+    buf = io.BytesIO(); single.save(buf); return buf.getvalue()
 
-    if isinstance(obj, pikepdf.Stream):
-        try:
-            data = obj.read_bytes()
-        except Exception:
-            data = b''
-        new_s = pikepdf.Stream(pdf, data)
-        for k, v in obj.stream_dict.items():
-            if k in ('/Length',):
-                continue
-            try:
-                new_s.stream_dict[k] = safe_copy(v, pdf)
-            except Exception:
-                pass
-        return new_s
-    elif isinstance(obj, pikepdf.Dictionary):
-        d = pikepdf.Dictionary()
-        for k, v in obj.items():
-            try:
-                d[k] = safe_copy(v, pdf)
-            except Exception:
-                pass
-        return d
-    elif isinstance(obj, pikepdf.Array):
-        result = []
-        for item in obj:
-            try:
-                result.append(safe_copy(item, pdf))
-            except Exception:
-                result.append(item)
-        return pikepdf.Array(result)
-    else:
-        # Scalar: Name, String, Integer, Boolean, Real
-        return obj
-
-def get_page_stream(pg):
+def build_xobject(page_bytes, cw_pt, ch_pt, out):
+    """Build Form XObject from single-page PDF bytes."""
+    pg_src = Pdf.open(io.BytesIO(page_bytes))
+    pg = pg_src.pages[0]
     contents = pg.obj.get('/Contents')
-    if contents is None:
-        return b''
     if isinstance(contents, pikepdf.Array):
-        return b' '.join(s.read_bytes() for s in contents)
-    return contents.read_bytes()
-
-def make_xobject(pg, out):
-    """Build a Form XObject from a page without using as_form_xobject."""
-    CW = float(pg.mediabox[2]) - float(pg.mediabox[0])
-    CH = float(pg.mediabox[3]) - float(pg.mediabox[1])
-    ox = float(pg.mediabox[0])
-    oy = float(pg.mediabox[1])
-
-    stream_data = get_page_stream(pg)
+        stream_data = b' '.join(s.read_bytes() for s in contents)
+    else:
+        stream_data = contents.read_bytes() if contents else b''
     resources = pg.obj.get('/Resources', pikepdf.Dictionary())
-    res_copy = safe_copy(resources, out)
-
-    # If page has a non-zero origin, prepend a translate
-    if ox != 0 or oy != 0:
-        prefix = f"{-ox:.3f} {-oy:.3f} cm\n".encode()
-        stream_data = prefix + stream_data
-
+    res_out = pikepdf.Dictionary()
+    for rkey in ['/Font','/XObject','/ExtGState','/ColorSpace',
+                 '/Pattern','/Shading','/ProcSet','/Properties']:
+        if rkey not in resources:
+            continue
+        v = resources[rkey]
+        # Try direct copy_foreign first (works if indirect)
+        if v.is_indirect:
+            try:
+                res_out[rkey] = out.copy_foreign(v)
+                continue
+            except Exception:
+                pass
+        # Non-indirect: copy each sub-item individually
+        if isinstance(v, pikepdf.Dictionary):
+            sub = pikepdf.Dictionary()
+            for kk, vv in v.items():
+                try:
+                    sub[kk] = out.copy_foreign(vv)
+                except Exception:
+                    sub[kk] = vv  # fallback: use as-is
+            res_out[rkey] = sub
+        elif isinstance(v, pikepdf.Array):
+            items = []
+            for i in v:
+                try:
+                    items.append(out.copy_foreign(i))
+                except Exception:
+                    items.append(i)
+            res_out[rkey] = pikepdf.Array(items)
+        else:
+            res_out[rkey] = v
     xobj = pikepdf.Stream(out, stream_data,
-        Type=pikepdf.Name.XObject,
-        Subtype=pikepdf.Name.Form,
-        FormType=1,
-        BBox=pikepdf.Array([0, 0, CW, CH]),
-        Resources=res_copy
-    )
-    return xobj, CW, CH
+        Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
+        BBox=pikepdf.Array([0, 0, cw_pt, ch_pt]), Resources=res_out)
+    return xobj
 
 def extend_bleed(img, bpx, method):
     w, h = img.size
@@ -114,70 +95,40 @@ def extend_bleed(img, bpx, method):
     out.paste(img,(bpx,bpx))
     return out
 
-COLORS = {
-    'black':(0,0,0),'white':(1,1,1),'cyan':(0,1,1),
-    'magenta':(1,0,1),'yellow':(1,1,0),'red':(1,0,0)
-}
+COLORS = {'black':(0,0,0),'white':(1,1,1),'cyan':(0,1,1),
+          'magenta':(1,0,1),'yellow':(1,1,0),'red':(1,0,0)}
 
 def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw):
-    src = Pdf.open(io.BytesIO(src_bytes))  # keep alive entire function
-    out = Pdf.new()
-    SW,SH,CW,CH,GP = pt(sw),pt(sh),pt(cw),pt(ch),pt(gap)
+    CW,CH = pt(cw),pt(ch)
+    SW,SH,GP = pt(sw),pt(sh),pt(gap)
     sx = (SW - cols*CW - (cols-1)*GP) / 2
     sy = (SH - rows*CH - (rows-1)*GP) / 2
+    num = min(sides, len(Pdf.open(io.BytesIO(src_bytes)).pages))
 
-    # Pre-extract all page data before any copying
-    page_data = []
-    for pi in range(min(sides, len(src.pages))):
-        pg = src.pages[pi]
-        mb = pg.mediabox
-        ox,oy = float(mb[0]),float(mb[1])
-        ow,oh = float(mb[2])-ox, float(mb[3])-oy
+    # Extract each page as standalone bytes first
+    page_bytes_list = [page_to_bytes(src_bytes, i, CW, CH) for i in range(num)]
 
-        cx0 = ox + (ow-CW)/2; cy0 = oy + (oh-CH)/2
-        pg.cropbox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
-        pg.mediabox = Rectangle(cx0, cy0, cx0+CW, cy0+CH)
-
-        stream_data = get_page_stream(pg)
-        resources = pg.obj.get('/Resources', pikepdf.Dictionary())
-        page_data.append((stream_data, resources))
-
-    # Now build output pages (src still alive)
-    for pi, (stream_data, resources) in enumerate(page_data):
-        res_copy = safe_copy(resources, out)
-
-        xobj = pikepdf.Stream(out, stream_data,
-            Type=pikepdf.Name.XObject,
-            Subtype=pikepdf.Name.Form,
-            FormType=1,
-            BBox=pikepdf.Array([0, 0, CW, CH]),
-            Resources=res_copy
-        )
+    out = Pdf.new()
+    for pi, pb in enumerate(page_bytes_list):
+        xobj = build_xobject(pb, CW, CH, out)
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         page_res = pikepdf.Dictionary(XObject=xd)
-
         mirror = (pi == 1); lines = []
         for r in range(rows):
             for c in range(cols):
                 ci = (cols-1-c) if mirror else c
-                x = sx + ci*(CW+GP)
-                y = sy + (rows-1-r)*(CH+GP)
+                x = sx + ci*(CW+GP); y = sy + (rows-1-r)*(CH+GP)
                 lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
                 if border and bw > 0:
                     bwpt = pt(bw); bc = border
                     lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
                                  f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
-
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
             Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
             Resources=page_res,
             Contents=pikepdf.Stream(out, "\n".join(lines).encode())
         )))
-
-    buf = io.BytesIO()
-    out.save(buf)
-    src.close()  # explicit close after save
-    return buf.getvalue()
+    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
 
 def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
                   border, bw, dpi, method):
@@ -203,24 +154,22 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
         wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
 
         png=io.BytesIO(); wb.save(png,'PNG'); png_b=png.getvalue()
-        ip=Pdf.new()
         imd=pikepdf.Dictionary()
-        st=pikepdf.Stream(ip,png_b,Type=pikepdf.Name.XObject,Subtype=pikepdf.Name.Image,
-            Width=wb.width,Height=wb.height,ColorSpace=pikepdf.Name.DeviceRGB,
-            BitsPerComponent=8,Filter=pikepdf.Name.FlateDecode)
+        st=pikepdf.Stream(out, png_b,
+            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
+            Width=wb.width, Height=wb.height,
+            ColorSpace=pikepdf.Name.DeviceRGB,
+            BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
         imd["/Im"]=st
 
-        # Build XObject manually without as_form_xobject
-        content_str = f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode()
-        xobj = pikepdf.Stream(out, content_str,
-            Type=pikepdf.Name.XObject,
-            Subtype=pikepdf.Name.Form,
-            FormType=1,
+        xobj = pikepdf.Stream(out,
+            f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode(),
+            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
             BBox=pikepdf.Array([0, 0, TW, TH]),
-            Resources=pikepdf.Dictionary(XObject=imd)
-        )
-        xd2=pikepdf.Dictionary(); xd2["/C"]=xobj
-        res2=pikepdf.Dictionary(XObject=xd2)
+            Resources=pikepdf.Dictionary(XObject=imd))
+
+        xd=pikepdf.Dictionary(); xd["/C"]=xobj
+        res=pikepdf.Dictionary(XObject=xd)
         mirror=(pi==1); lines=[]
         for r in range(rows):
             for c in range(cols):
@@ -232,8 +181,9 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
                     lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
                                  f"{x:.3f} {y:.3f} {TW:.3f} {TH:.3f} re S")
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
-            Type=pikepdf.Name.Page,MediaBox=[0,0,SW,SH],
-            Resources=res2,Contents=pikepdf.Stream(out,"\n".join(lines).encode()))))
+            Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
+            Resources=res,
+            Contents=pikepdf.Stream(out, "\n".join(lines).encode()))))
 
     buf=io.BytesIO(); out.save(buf); return buf.getvalue()
 
