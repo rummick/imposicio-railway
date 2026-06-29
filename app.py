@@ -103,12 +103,21 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
     SW,SH,GP = pt(sw),pt(sh),pt(gap)
     sx = (SW - cols*CW - (cols-1)*GP) / 2
     sy = (SH - rows*CH - (rows-1)*GP) / 2
-    num = min(sides, len(Pdf.open(io.BytesIO(src_bytes)).pages))
+    src_pdf = Pdf.open(io.BytesIO(src_bytes))
+    num = min(sides, len(src_pdf.pages))
 
     # Extract each page as standalone bytes first
     page_bytes_list = [page_to_bytes(src_bytes, i, CW, CH) for i in range(num)]
 
     out = Pdf.new()
+
+    # Copy OCProperties if present (for InDesign layers)
+    if '/OCProperties' in src_pdf.Root:
+        try:
+            out.Root['/OCProperties'] = out.copy_foreign(src_pdf.Root['/OCProperties'])
+        except Exception:
+            pass
+
     for pi, pb in enumerate(page_bytes_list):
         xobj = build_xobject(pb, CW, CH, out)
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
