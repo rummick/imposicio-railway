@@ -5,12 +5,13 @@ import fitz
 from PIL import Image
 import io, os, traceback
 
+VERSION = '2.1'
 app = Flask(__name__)
 MM = 72 / 25.4
 def pt(mm): return mm * MM
 
 def copy_resources(resources, out):
-    """Copy page resources into target PDF."""
+    """Copy page resources into target PDF, handling direct and indirect objects."""
     res_out = pikepdf.Dictionary()
     for rkey in ['/Font','/XObject','/ExtGState','/ColorSpace',
                  '/Pattern','/Shading','/ProcSet','/Properties']:
@@ -36,7 +37,7 @@ def copy_resources(resources, out):
     return res_out
 
 def build_page_xobject(src_pdf, page_idx, out):
-    """Build Form XObject for full page (no crop - crop via CTM transform)."""
+    """Build Form XObject for full page. Crop applied externally via clip+translate."""
     pg = src_pdf.pages[page_idx]
     mb = pg.mediabox
     x0,y0 = float(mb[0]),float(mb[1])
@@ -48,23 +49,19 @@ def build_page_xobject(src_pdf, page_idx, out):
     else:
         sd = contents.read_bytes() if contents else b''
 
-    resources = pg.obj.get('/Resources', pikepdf.Dictionary())
-    res_out = copy_resources(resources, out)
-
-    # If page origin is not 0,0, prepend translate
+    # Normalize origin to 0,0 if needed
     if abs(x0) > 0.01 or abs(y0) > 0.01:
         sd = f"q {-x0:.4f} {-y0:.4f} cm\n".encode() + sd + b"\nQ"
-        pw_bbox = pw; ph_bbox = ph
-    else:
-        pw_bbox = pw; ph_bbox = ph
 
+    resources = pg.obj.get('/Resources', pikepdf.Dictionary())
     xobj = pikepdf.Stream(out, sd,
         Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
-        BBox=pikepdf.Array([0, 0, pw_bbox, ph_bbox]),
-        Resources=res_out)
+        BBox=pikepdf.Array([0, 0, pw, ph]),
+        Resources=copy_resources(resources, out))
     return xobj, pw, ph
 
 def extend_bleed(img, bpx, method):
+    """Extend image borders by bpx pixels using stretch or mirror method."""
     w, h = img.size
     nw, nh = w+2*bpx, h+2*bpx
     out = Image.new(img.mode, (nw, nh))
@@ -77,7 +74,7 @@ def extend_bleed(img, bpx, method):
         out.paste(img.crop((w-1,0,w,1)).resize((bpx,bpx),Image.NEAREST),(nw-bpx,0))
         out.paste(img.crop((0,h-1,1,h)).resize((bpx,bpx),Image.NEAREST),(0,nh-bpx))
         out.paste(img.crop((w-1,h-1,w,h)).resize((bpx,bpx),Image.NEAREST),(nw-bpx,nh-bpx))
-    else:
+    else:  # mirror
         out.paste(img.crop((0,0,w,bpx)).transpose(Image.FLIP_TOP_BOTTOM),(bpx,0))
         out.paste(img.crop((0,h-bpx,w,h)).transpose(Image.FLIP_TOP_BOTTOM),(bpx,nh-bpx))
         out.paste(img.crop((0,0,bpx,h)).transpose(Image.FLIP_LEFT_RIGHT),(0,bpx))
@@ -101,49 +98,44 @@ def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw)
     num = min(sides, len(src_pdf.pages))
     out = Pdf.new()
 
+    # Preserve optional content layers (InDesign/Illustrator)
     if '/OCProperties' in src_pdf.Root:
         try: out.Root['/OCProperties'] = out.copy_foreign(src_pdf.Root['/OCProperties'])
         except Exception: pass
 
     for pi in range(num):
         xobj, pw, ph = build_page_xobject(src_pdf, pi, out)
-
-        # Scale factors: from full page size to crop size
-        # Crop is centered on page, so we offset by crop origin
         crop_ox = (pw - CW) / 2
         crop_oy = (ph - CH) / 2
 
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
-        page_res = pikepdf.Dictionary(XObject=xd)
         mirror = (pi == 1); lines = []
 
         for r in range(rows):
             for c in range(cols):
                 ci = (cols-1-c) if mirror else c
-                # Position on sheet
                 px = sx_grid + ci*(CW+GP)
                 py = sy_grid + (rows-1-r)*(CH+GP)
-                # CTM: translate to (px,py), then shift so crop_ox maps to 0
-                # Result: page content at (px - crop_ox, py - crop_oy)
-                # Clip to [px, py, px+CW, py+CH]
+                # Clip to card area, then translate so crop origin maps to card origin
                 tx = px - crop_ox
                 ty = py - crop_oy
                 lines.append(
-                    f"q "
-                    f"{px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re W n "
-                    f"1 0 0 1 {tx:.3f} {ty:.3f} cm "
-                    f"/C Do Q"
+                    f"q {px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re W n "
+                    f"1 0 0 1 {tx:.3f} {ty:.3f} cm /C Do Q"
                 )
                 if border and bw > 0:
-                    bwpt = pt(bw); bc = border
-                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
-                                 f"{px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re S")
+                    bc = border
+                    lines.append(
+                        f"{bc[0]} {bc[1]} {bc[2]} RG {pt(bw):.3f} w "
+                        f"{px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re S"
+                    )
 
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
             Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=page_res,
+            Resources=pikepdf.Dictionary(XObject=xd),
             Contents=pikepdf.Stream(out, "\n".join(lines).encode())
         )))
+
     buf = io.BytesIO(); out.save(buf); return buf.getvalue()
 
 def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
@@ -156,66 +148,69 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
     sx = (SW - cols*TW - (cols-1)*GP) / 2
     sy = (SH - rows*TH - (rows-1)*GP) / 2
     scale = dpi / 72.0
+    bpx = int(bleed * (dpi/25.4))  # bleed in pixels at target dpi
 
     for pi in range(min(sides, doc.page_count)):
         page = doc[pi]
-        ow,oh = page.rect.width, page.rect.height
-        cwpt,chpt = pt(cw), pt(ch)
-        bleedpt = pt(bleed)
+        ow, oh = page.rect.width, page.rect.height
+        cwpt, chpt = pt(cw), pt(ch)
+
+        # Render page at target DPI
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
         if method == 'included':
-            # Sang ja inclosa: crop a mida final+sang directament
-            total_w = cwpt + 2*bleedpt
-            total_h = chpt + 2*bleedpt
+            # Bleed already in PDF: crop to final+bleed size directly
+            total_w = cwpt + 2*pt(bleed)
+            total_h = chpt + 2*pt(bleed)
             ox0 = (ow - total_w) / 2; oy0 = (oh - total_h) / 2
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
-            img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
             cx0 = max(0, int(ox0*scale)); cy0 = max(0, int(oy0*scale))
-            cx1 = min(img.width, int((ox0+total_w)*scale))
-            cy1 = min(img.height, int((oy0+total_h)*scale))
+            cx1 = min(img.width, cx0 + int(total_w*scale))
+            cy1 = min(img.height, cy0 + int(total_h*scale))
             wb = img.crop((cx0, cy0, cx1, cy1))
         else:
-            # Sang generada: crop a mida final, després extensió
-            ox0,oy0 = (ow-cwpt)/2, (oh-chpt)/2
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
-            img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
-            cx0=max(0,int(ox0*scale)); cy0=max(0,int(oy0*scale))
-            cx1=min(img.width,int((ox0+cwpt)*scale))
-            cy1=min(img.height,int((oy0+chpt)*scale))
-            wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
+            # Generate bleed: crop to final size then extend borders
+            ox0 = (ow - cwpt) / 2; oy0 = (oh - chpt) / 2
+            cx0 = max(0, int(ox0*scale)); cy0 = max(0, int(oy0*scale))
+            cx1 = min(img.width, cx0 + int(cwpt*scale))
+            cy1 = min(img.height, cy0 + int(chpt*scale))
+            wb = extend_bleed(img.crop((cx0, cy0, cx1, cy1)), bpx, method)
 
-        # Store raw RGB pixels — pikepdf.Stream applies FlateDecode automatically
-        raw_pixels = wb.tobytes()  # raw uncompressed RGB bytes
-        imd=pikepdf.Dictionary()
-        st = out.make_stream(raw_pixels,
+        # Store as JPEG (DCTDecode) — compact and correctly handled by all PDF viewers
+        jpg_buf = io.BytesIO()
+        wb.save(jpg_buf, 'JPEG', quality=92)
+        jpg_data = jpg_buf.getvalue()
+
+        im_stream = pikepdf.Stream(out, jpg_data,
             Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
             Width=wb.width, Height=wb.height,
             ColorSpace=pikepdf.Name.DeviceRGB,
-            BitsPerComponent=8)
-        imd["/Im"]=st
-        xobj = pikepdf.Stream(out,
-            f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode(),
-            Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
-            BBox=pikepdf.Array([0, 0, TW, TH]),
-            Resources=pikepdf.Dictionary(XObject=imd))
-        xd=pikepdf.Dictionary(); xd["/C"]=xobj
-        res=pikepdf.Dictionary(XObject=xd)
-        mirror=(pi==1); lines=[]
+            BitsPerComponent=8,
+            Filter=pikepdf.Name.DCTDecode)
+
+        imd = pikepdf.Dictionary()
+        imd[pikepdf.Name.Im] = im_stream
+        mirror = (pi == 1); lines = []
         for r in range(rows):
             for c in range(cols):
-                ci=(cols-1-c) if mirror else c
-                x=sx+ci*(TW+GP); y=sy+(rows-1-r)*(TH+GP)
-                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
-                if border and bw>0:
-                    bwpt=pt(bw); bc=border
-                    lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
-                                 f"{x:.3f} {y:.3f} {TW:.3f} {TH:.3f} re S")
+                ci = (cols-1-c) if mirror else c
+                x = sx + ci*(TW+GP); y = sy + (rows-1-r)*(TH+GP)
+                # Scale+translate image to card position
+                lines.append(f"q {TW:.3f} 0 0 {TH:.3f} {x:.3f} {y:.3f} cm /Im Do Q")
+                if border and bw > 0:
+                    bc = border
+                    lines.append(
+                        f"{bc[0]} {bc[1]} {bc[2]} RG {pt(bw):.3f} w "
+                        f"{x:.3f} {y:.3f} {TW:.3f} {TH:.3f} re S"
+                    )
+
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
             Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
-            Resources=res,
-            Contents=pikepdf.Stream(out, "\n".join(lines).encode()))))
+            Resources=pikepdf.Dictionary(XObject=imd),
+            Contents=pikepdf.Stream(out, "\n".join(lines).encode())
+        )))
 
-    buf=io.BytesIO(); out.save(buf); return buf.getvalue()
+    buf = io.BytesIO(); out.save(buf); return buf.getvalue()
 
 
 @app.after_request
@@ -247,34 +242,42 @@ def impose():
     try:
         pdf_bytes = request.files['pdf'].read()
         p = request.form
-        sw=float(p.get('sheetW',320)); sh=float(p.get('sheetH',450))
-        cw=float(p.get('cropW',0)) or None; ch=float(p.get('cropH',0)) or None
-        cols=int(p.get('cols',3)); rows=int(p.get('rows',6))
-        gap=float(p.get('gap',0)); sides=int(p.get('sides',1))
-        bleed=float(p.get('bleedMM',0)); bmet=p.get('bleedMethod','stretch')
-        dpi=int(p.get('renderDPI',300))
-        bcol=COLORS.get(p.get('borderColor','')); bw=float(p.get('borderWidth',0.25))
+        sw    = float(p.get('sheetW', 320))
+        sh    = float(p.get('sheetH', 450))
+        cw    = float(p.get('cropW', 0)) or None
+        ch    = float(p.get('cropH', 0)) or None
+        cols  = int(p.get('cols', 3))
+        rows  = int(p.get('rows', 6))
+        gap   = float(p.get('gap', 0))
+        sides = int(p.get('sides', 1))
+        bleed = float(p.get('bleedMM', 0))
+        bmet  = p.get('bleedMethod', 'stretch')
+        dpi   = int(p.get('renderDPI', 300))
+        bcol  = COLORS.get(p.get('borderColor', ''))
+        bw    = float(p.get('borderWidth', 0.25))
 
-        src=Pdf.open(io.BytesIO(pdf_bytes)); pg0=src.pages[0]; mb=pg0.mediabox
-        cw=cw or round((float(mb[2])-float(mb[0]))/MM,2)
-        ch=ch or round((float(mb[3])-float(mb[1]))/MM,2)
+        src = Pdf.open(io.BytesIO(pdf_bytes))
+        pg0 = src.pages[0]; mb = pg0.mediabox
+        cw = cw or round((float(mb[2])-float(mb[0]))/MM, 2)
+        ch = ch or round((float(mb[3])-float(mb[1]))/MM, 2)
 
-        if bleed>0:
-            result=impose_raster(pdf_bytes,sw,sh,cw,ch,bleed,cols,rows,gap,sides,bcol,bw,dpi,bmet)
+        if bleed > 0:
+            result = impose_raster(pdf_bytes, sw, sh, cw, ch, bleed,
+                                   cols, rows, gap, sides, bcol, bw, dpi, bmet)
         else:
-            result=impose_vector(pdf_bytes,sw,sh,cw,ch,cols,rows,gap,sides,bcol,bw)
+            result = impose_vector(pdf_bytes, sw, sh, cw, ch,
+                                   cols, rows, gap, sides, bcol, bw)
 
         return send_file(io.BytesIO(result), mimetype='application/pdf',
-                        as_attachment=True,
-                        download_name=f'impose_{cols}x{rows}.pdf')
+                         as_attachment=True,
+                         download_name=f'impose_{cols}x{rows}.pdf')
     except Exception as e:
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 @app.route('/', methods=['GET'])
-def health(): return jsonify({'status': 'ok', 'service': 'imposicio-railway'})
+def health():
+    return jsonify({'status': 'ok', 'service': 'imposicio-railway', 'version': VERSION})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-# v2.0 - build_page_xobject with clip+translate
