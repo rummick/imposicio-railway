@@ -9,66 +9,60 @@ app = Flask(__name__)
 MM = 72 / 25.4
 def pt(mm): return mm * MM
 
-def page_to_bytes(src_bytes, page_idx, cw_pt, ch_pt):
-    """Extract a page as standalone single-page PDF with crop applied."""
-    src = Pdf.open(io.BytesIO(src_bytes))
-    pg = src.pages[page_idx]
-    mb = pg.mediabox
-    ox,oy = float(mb[0]),float(mb[1])
-    ow,oh = float(mb[2])-ox, float(mb[3])-oy
-    cx0 = ox + (ow-cw_pt)/2; cy0 = oy + (oh-ch_pt)/2
-    pg.cropbox = Rectangle(cx0, cy0, cx0+cw_pt, cy0+ch_pt)
-    pg.mediabox = Rectangle(cx0, cy0, cx0+cw_pt, cy0+ch_pt)
-    single = Pdf.new()
-    single.pages.extend([pg])
-    buf = io.BytesIO(); single.save(buf); return buf.getvalue()
-
-def build_xobject(page_bytes, cw_pt, ch_pt, out):
-    """Build Form XObject from single-page PDF bytes."""
-    pg_src = Pdf.open(io.BytesIO(page_bytes))
-    pg = pg_src.pages[0]
-    contents = pg.obj.get('/Contents')
-    if isinstance(contents, pikepdf.Array):
-        stream_data = b' '.join(s.read_bytes() for s in contents)
-    else:
-        stream_data = contents.read_bytes() if contents else b''
-    resources = pg.obj.get('/Resources', pikepdf.Dictionary())
+def copy_resources(resources, out):
+    """Copy page resources into target PDF."""
     res_out = pikepdf.Dictionary()
     for rkey in ['/Font','/XObject','/ExtGState','/ColorSpace',
                  '/Pattern','/Shading','/ProcSet','/Properties']:
-        if rkey not in resources:
-            continue
+        if rkey not in resources: continue
         v = resources[rkey]
-        # Try direct copy_foreign first (works if indirect)
         if v.is_indirect:
-            try:
-                res_out[rkey] = out.copy_foreign(v)
-                continue
-            except Exception:
-                pass
-        # Non-indirect: copy each sub-item individually
+            try: res_out[rkey] = out.copy_foreign(v); continue
+            except Exception: pass
         if isinstance(v, pikepdf.Dictionary):
             sub = pikepdf.Dictionary()
-            for kk, vv in v.items():
-                try:
-                    sub[kk] = out.copy_foreign(vv)
-                except Exception:
-                    sub[kk] = vv  # fallback: use as-is
+            for kk,vv in v.items():
+                try: sub[kk] = out.copy_foreign(vv)
+                except Exception: sub[kk] = vv
             res_out[rkey] = sub
         elif isinstance(v, pikepdf.Array):
             items = []
             for i in v:
-                try:
-                    items.append(out.copy_foreign(i))
-                except Exception:
-                    items.append(i)
+                try: items.append(out.copy_foreign(i))
+                except Exception: items.append(i)
             res_out[rkey] = pikepdf.Array(items)
         else:
             res_out[rkey] = v
-    xobj = pikepdf.Stream(out, stream_data,
+    return res_out
+
+def build_page_xobject(src_pdf, page_idx, out):
+    """Build Form XObject for full page (no crop - crop via CTM transform)."""
+    pg = src_pdf.pages[page_idx]
+    mb = pg.mediabox
+    x0,y0 = float(mb[0]),float(mb[1])
+    pw = float(mb[2])-x0; ph = float(mb[3])-y0
+
+    contents = pg.obj.get('/Contents')
+    if isinstance(contents, pikepdf.Array):
+        sd = b' '.join(s.read_bytes() for s in contents)
+    else:
+        sd = contents.read_bytes() if contents else b''
+
+    resources = pg.obj.get('/Resources', pikepdf.Dictionary())
+    res_out = copy_resources(resources, out)
+
+    # If page origin is not 0,0, prepend translate
+    if abs(x0) > 0.01 or abs(y0) > 0.01:
+        sd = f"q {-x0:.4f} {-y0:.4f} cm\n".encode() + sd + b"\nQ"
+        pw_bbox = pw; ph_bbox = ph
+    else:
+        pw_bbox = pw; ph_bbox = ph
+
+    xobj = pikepdf.Stream(out, sd,
         Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
-        BBox=pikepdf.Array([0, 0, cw_pt, ch_pt]), Resources=res_out)
-    return xobj
+        BBox=pikepdf.Array([0, 0, pw_bbox, ph_bbox]),
+        Resources=res_out)
+    return xobj, pw, ph
 
 def extend_bleed(img, bpx, method):
     w, h = img.size
@@ -99,39 +93,52 @@ COLORS = {'black':(0,0,0),'white':(1,1,1),'cyan':(0,1,1),
           'magenta':(1,0,1),'yellow':(1,1,0),'red':(1,0,0)}
 
 def impose_vector(src_bytes, sw, sh, cw, ch, cols, rows, gap, sides, border, bw):
+    src_pdf = Pdf.open(io.BytesIO(src_bytes))
     CW,CH = pt(cw),pt(ch)
     SW,SH,GP = pt(sw),pt(sh),pt(gap)
-    sx = (SW - cols*CW - (cols-1)*GP) / 2
-    sy = (SH - rows*CH - (rows-1)*GP) / 2
-    src_pdf = Pdf.open(io.BytesIO(src_bytes))
+    sx_grid = (SW - cols*CW - (cols-1)*GP) / 2
+    sy_grid = (SH - rows*CH - (rows-1)*GP) / 2
     num = min(sides, len(src_pdf.pages))
-
-    # Extract each page as standalone bytes first
-    page_bytes_list = [page_to_bytes(src_bytes, i, CW, CH) for i in range(num)]
-
     out = Pdf.new()
 
-    # Copy OCProperties if present (for InDesign layers)
     if '/OCProperties' in src_pdf.Root:
-        try:
-            out.Root['/OCProperties'] = out.copy_foreign(src_pdf.Root['/OCProperties'])
-        except Exception:
-            pass
+        try: out.Root['/OCProperties'] = out.copy_foreign(src_pdf.Root['/OCProperties'])
+        except Exception: pass
 
-    for pi, pb in enumerate(page_bytes_list):
-        xobj = build_xobject(pb, CW, CH, out)
+    for pi in range(num):
+        xobj, pw, ph = build_page_xobject(src_pdf, pi, out)
+
+        # Scale factors: from full page size to crop size
+        # Crop is centered on page, so we offset by crop origin
+        crop_ox = (pw - CW) / 2
+        crop_oy = (ph - CH) / 2
+
         xd = pikepdf.Dictionary(); xd["/C"] = xobj
         page_res = pikepdf.Dictionary(XObject=xd)
         mirror = (pi == 1); lines = []
+
         for r in range(rows):
             for c in range(cols):
                 ci = (cols-1-c) if mirror else c
-                x = sx + ci*(CW+GP); y = sy + (rows-1-r)*(CH+GP)
-                lines.append(f"q 1 0 0 1 {x:.3f} {y:.3f} cm /C Do Q")
+                # Position on sheet
+                px = sx_grid + ci*(CW+GP)
+                py = sy_grid + (rows-1-r)*(CH+GP)
+                # CTM: translate to (px,py), then shift so crop_ox maps to 0
+                # Result: page content at (px - crop_ox, py - crop_oy)
+                # Clip to [px, py, px+CW, py+CH]
+                tx = px - crop_ox
+                ty = py - crop_oy
+                lines.append(
+                    f"q "
+                    f"{px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re W n "
+                    f"1 0 0 1 {tx:.3f} {ty:.3f} cm "
+                    f"/C Do Q"
+                )
                 if border and bw > 0:
                     bwpt = pt(bw); bc = border
                     lines.append(f"{bc[0]} {bc[1]} {bc[2]} RG {bwpt:.3f} w "
-                                 f"{x:.3f} {y:.3f} {CW:.3f} {CH:.3f} re S")
+                                 f"{px:.3f} {py:.3f} {CW:.3f} {CH:.3f} re S")
+
         out.pages.append(pikepdf.Page(pikepdf.Dictionary(
             Type=pikepdf.Name.Page, MediaBox=[0,0,SW,SH],
             Resources=page_res,
@@ -170,13 +177,11 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
             ColorSpace=pikepdf.Name.DeviceRGB,
             BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
         imd["/Im"]=st
-
         xobj = pikepdf.Stream(out,
             f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode(),
             Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, FormType=1,
             BBox=pikepdf.Array([0, 0, TW, TH]),
             Resources=pikepdf.Dictionary(XObject=imd))
-
         xd=pikepdf.Dictionary(); xd["/C"]=xobj
         res=pikepdf.Dictionary(XObject=xd)
         mirror=(pi==1); lines=[]
