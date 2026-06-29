@@ -169,13 +169,14 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
         cy1=min(img.height,int((oy0+chpt)*scale))
         wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
 
-        png=io.BytesIO(); wb.save(png,'PNG'); png_b=png.getvalue()
+        # Store raw RGB pixels — pikepdf.Stream applies FlateDecode automatically
+        raw_pixels = wb.tobytes()  # raw uncompressed RGB bytes
         imd=pikepdf.Dictionary()
-        st=pikepdf.Stream(out, png_b,
+        st = out.make_stream(raw_pixels,
             Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Image,
             Width=wb.width, Height=wb.height,
             ColorSpace=pikepdf.Name.DeviceRGB,
-            BitsPerComponent=8, Filter=pikepdf.Name.FlateDecode)
+            BitsPerComponent=8)
         imd["/Im"]=st
         xobj = pikepdf.Stream(out,
             f"q {TW:.3f} 0 0 {TH:.3f} 0 0 cm /Im Do Q".encode(),
@@ -260,3 +261,5 @@ def health(): return jsonify({'status': 'ok', 'service': 'imposicio-railway'})
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
+# v2.0 - build_page_xobject with clip+translate
