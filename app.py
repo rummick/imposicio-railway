@@ -161,13 +161,28 @@ def impose_raster(src_bytes, sw, sh, cw, ch, bleed, cols, rows, gap, sides,
         page = doc[pi]
         ow,oh = page.rect.width, page.rect.height
         cwpt,chpt = pt(cw), pt(ch)
-        ox0,oy0 = (ow-cwpt)/2, (oh-chpt)/2
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
-        img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
-        cx0=max(0,int(ox0*scale)); cy0=max(0,int(oy0*scale))
-        cx1=min(img.width,int((ox0+cwpt)*scale))
-        cy1=min(img.height,int((oy0+chpt)*scale))
-        wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
+        bleedpt = pt(bleed)
+
+        if method == 'included':
+            # Sang ja inclosa: crop a mida final+sang directament
+            total_w = cwpt + 2*bleedpt
+            total_h = chpt + 2*bleedpt
+            ox0 = (ow - total_w) / 2; oy0 = (oh - total_h) / 2
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
+            img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+            cx0 = max(0, int(ox0*scale)); cy0 = max(0, int(oy0*scale))
+            cx1 = min(img.width, int((ox0+total_w)*scale))
+            cy1 = min(img.height, int((oy0+total_h)*scale))
+            wb = img.crop((cx0, cy0, cx1, cy1))
+        else:
+            # Sang generada: crop a mida final, després extensió
+            ox0,oy0 = (ow-cwpt)/2, (oh-chpt)/2
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale,scale), alpha=False)
+            img = Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
+            cx0=max(0,int(ox0*scale)); cy0=max(0,int(oy0*scale))
+            cx1=min(img.width,int((ox0+cwpt)*scale))
+            cy1=min(img.height,int((oy0+chpt)*scale))
+            wb = extend_bleed(img.crop((cx0,cy0,cx1,cy1)), int(bleed*(dpi/25.4)), method)
 
         # Store raw RGB pixels — pikepdf.Stream applies FlateDecode automatically
         raw_pixels = wb.tobytes()  # raw uncompressed RGB bytes
